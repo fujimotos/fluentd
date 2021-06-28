@@ -31,7 +31,21 @@ else
   Fluent::FileWrapper = File
 end
 
+WORKERS = 8
+
+def parse_ltsv(text)
+  record = {}
+  text.chomp.split("\t").each do |pair|
+    if pair.include? ":"
+      key, value = pair.split(':', 2)
+      record[key.freeze] = value.freeze
+    end
+  end
+  return record.freeze
+end
+
 module Fluent::Plugin
+
   class TailInput < Fluent::Plugin::Input
     Fluent::Plugin.register_input('tail', self)
 
@@ -191,6 +205,16 @@ module Fluent::Plugin
           @read_bytes_limit_per_second = min_bytes
         end
       end
+
+      @ractors = WORKERS.times.map {
+        Ractor.new {
+          while true
+            lines = Ractor.receive
+            return if lines.nil?;
+            Ractor.yield lines.map { |line| parse_ltsv(line) }.freeze
+          end
+        }
+      }
     end
 
     def configure_tag
@@ -600,9 +624,30 @@ module Fluent::Plugin
 
     def parse_singleline(lines, tail_watcher)
       es = Fluent::MultiEventStream.new
-      lines.each { |line|
-        convert_line_to_event(line, es, tail_watcher)
+      slice = lines.length / WORKERS + 1
+      lines = lines.map{|x| x.freeze}
+
+      WORKERS.times.each { |i|
+        @ractors[i].send(lines.pop(slice).freeze)
       }
+
+      @ractors.each do |r|
+        records = r.take
+        records.each { |record|
+          time, record = @parser.convert_values(@parser.parse_time(record), record)
+          if time && record
+            record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+            es.add(time, record)
+          else
+            if @emit_unmatched_lines
+              record = {'unmatched_line' => line}
+              record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+              es.add(Fluent::EventTime.now, record)
+            end
+            log.warn "pattern not matched: #{line.inspect}"
+          end
+        }
+      end
       es
     end
 
